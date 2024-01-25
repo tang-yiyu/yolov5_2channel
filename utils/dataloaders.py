@@ -35,6 +35,7 @@ from utils.augmentations import (
     letterbox,
     mixup,
     random_perspective,
+    random_perspective_rgb_ir,
 )
 from utils.general import (
     DATASETS_DIR,
@@ -151,8 +152,9 @@ class SmartDistributedSampler(distributed.DistributedSampler):
         return iter(idx)
 
 
-def create_dataloader(
-    path,
+def create_dataloader_rgb_ir(
+    path1,
+    path2,
     imgsz,
     batch_size,
     stride,
@@ -174,8 +176,10 @@ def create_dataloader(
         LOGGER.warning("WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False")
         shuffle = False
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset = LoadImagesAndLabels(
-            path,
+        # 载入增强数据集
+        dataset = LoadMultiImagesAndLabels(
+            path1,
+            path2,
             imgsz,
             batch_size,
             augment=augment,  # augmentation
@@ -193,7 +197,9 @@ def create_dataloader(
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
+    # 分布式采样器
     sampler = None if rank == -1 else SmartDistributedSampler(dataset, shuffle=shuffle)
+    # 使用InfiniteDataLoader和_RepeatSampler来对DataLoader进行封装
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + seed + RANK)
@@ -204,7 +210,7 @@ def create_dataloader(
         num_workers=nw,
         sampler=sampler,
         pin_memory=PIN_MEMORY,
-        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
+        collate_fn=LoadMultiImagesAndLabels.collate_fn4 if quad else LoadMultiImagesAndLabels.collate_fn,
         worker_init_fn=seed_worker,
         generator=generator,
     ), dataset
@@ -972,6 +978,739 @@ class LoadImagesAndLabels(Dataset):
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
         return torch.stack(im, 0), torch.cat(label, 0), path, shapes
+
+    @staticmethod
+    def collate_fn4(batch):
+        im, label, path, shapes = zip(*batch)  # transposed
+        n = len(shapes) // 4
+        im4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
+        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+            i *= 4
+            if random.random() < 0.5:
+                im1 = F.interpolate(im[i].unsqueeze(0).float(), scale_factor=2.0, mode="bilinear", align_corners=False)[
+                    0
+                ].type(im[i].type())
+                lb = label[i]
+            else:
+                im1 = torch.cat((torch.cat((im[i], im[i + 1]), 1), torch.cat((im[i + 2], im[i + 3]), 1)), 2)
+                lb = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            im4.append(im1)
+            label4.append(lb)
+
+        for i, lb in enumerate(label4):
+            lb[:, 0] = i  # add target image index for build_targets()
+
+        return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+
+
+class LoadMultiImagesAndLabels(Dataset):
+    # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
+    cache_version = 0.6  # dataset labels *.cache version
+    rand_interp_methods = [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4]
+
+    def __init__(
+        self,
+        path_rgb,
+        path_ir,
+        img_size=640,
+        batch_size=16,
+        augment=False,
+        hyp=None,
+        rect=False,
+        image_weights=False,
+        cache_images=False,
+        single_cls=False,
+        stride=32,
+        pad=0.0,
+        min_items=0,
+        prefix="",
+        rank=-1,
+        seed=0,
+    ):
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.path_rgb = path_rgb
+        self.path_ir = path_ir
+        self.albumentations = Albumentations(size=img_size) if augment else None
+
+        # 得到path路径下的所有图片的路径
+        try:
+            #---------------------- RGB ----------------------
+            f_rgb = []  # image files
+            for p_rgb in path_rgb if isinstance(path_rgb, list) else [path_rgb]:
+                p_rgb = Path(p_rgb)  # os-agnostic
+                if p_rgb.is_dir():  # dir
+                    f_rgb += glob.glob(str(p_rgb / "**" / "*.*"), recursive=True)
+                    # f_rgb = list(p_rgb.rglob('*.*'))  # pathlib
+                elif p_rgb.is_file():  # file
+                    with open(p_rgb) as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p_rgb.parent) + os.sep
+                        f_rgb += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # to global path
+                        # f_rgb += [p_rgb.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
+                else:
+                    raise FileNotFoundError(f"{prefix}{p_rgb} does not exist")
+            self.im_files_rgb = sorted(x.replace("/", os.sep) for x in f_rgb if x.split(".")[-1].lower() in IMG_FORMATS)
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+            assert self.im_files_rgb, f"{prefix}No images found"
+
+            #---------------------- IR ----------------------
+            f_ir = []  # image files
+            for p_ir in path_ir if isinstance(path_ir, list) else [path_ir]:
+                p_ir = Path(p_ir)  # os-agnostic
+                if p_ir.is_dir():  # dir
+                    f_ir += glob.glob(str(p_ir / "**" / "*.*"), recursive=True)
+                    # f_ir = list(p_ir.rglob('*.*'))  # pathlib
+                elif p_ir.is_file():  # file
+                    with open(p_ir) as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p_ir.parent) + os.sep
+                        f_ir += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # to global path
+                        # f_ir += [p_ir.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
+                else:
+                    raise FileNotFoundError(f"{prefix}{p_ir} does not exist")
+            self.im_files_ir = sorted(x.replace("/", os.sep) for x in f_ir if x.split(".")[-1].lower() in IMG_FORMATS)
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+            assert self.im_files_ir, f"{prefix}No images found"
+
+        except Exception as e:
+            raise Exception(f"{prefix}Error loading data from {path_rgb, path_ir}: {e}\n{HELP_URL}") from e
+
+        # Check rgb cache
+        self.label_files_rgb = img2label_paths(self.im_files_rgb)  # labels 根据imgs路径找到labels的路径
+        cache_path_rgb = (p_rgb if p_rgb.is_file() else Path(self.label_files_rgb[0]).parent).with_suffix(".cache") # 下次运行这个脚本的时候直接从cache中取label而不是去文件中取label
+        try:
+            cache_rgb, exists_rgb = np.load(cache_path_rgb, allow_pickle=True).item(), True  # load dict 从cache文件中读出了nf, nm, ne, nc, n等信息
+            assert cache_rgb["version"] == self.cache_version  # matches current version
+            assert cache_rgb["hash"] == get_hash(self.label_files_rgb + self.im_files_rgb)  # identical hash
+        except Exception:
+            cache_rgb, exists_rgb = self.cache_labels(self.im_files_rgb, self.label_files_rgb, cache_path_rgb, prefix), False  # run cache ops
+
+        # Check ir cache
+        self.label_files_ir = img2label_paths(self.im_files_ir)  # labels 根据imgs路径找到labels的路径
+        cache_path_ir = (p_ir if p_ir.is_file() else Path(self.label_files_ir[0]).parent).with_suffix(".cache") # 下次运行这个脚本的时候直接从cache中取label而不是去文件中取label
+        try:
+            cache_ir, exists_ir = np.load(cache_path_ir, allow_pickle=True).item(), True  # load dict 从cache文件中读出了nf, nm, ne, nc, n等信息
+            assert cache_ir["version"] == self.cache_version  # matches current version
+            assert cache_ir["hash"] == get_hash(self.label_files_ir + self.im_files_ir)  # identical hash
+        except Exception:
+            cache_ir, exists_ir = self.cache_labels(self.im_files_ir,self.label_files_ir, cache_path_ir, prefix), False  # run cache ops
+
+        # Display rgb cache
+        # 打印cache的结果 nf nm ne nc n = 找到的标签数量，漏掉的标签数量，空的标签数量，损坏的标签数量，总的标签数量
+        nf_rgb, nm_rgb, ne_rgb, nc_rgb, n_rgb = cache_rgb.pop("results")  # found, missing, empty, corrupt, total
+        if exists_rgb and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path_rgb}... {nf_rgb} images, {nm_rgb + ne_rgb} backgrounds, {nc_rgb} corrupt"
+            tqdm(None, desc=prefix + d, total=n_rgb, initial=n_rgb, bar_format=TQDM_BAR_FORMAT)  # display cache results
+            if cache_rgb["msgs"]:
+                LOGGER.info("\n".join(cache_rgb["msgs"]))  # display warnings
+        assert nf_rgb > 0 or not augment, f"{prefix}No labels found in {cache_path_rgb}, can not start training. {HELP_URL}"
+
+        # Display ir cache
+        nf_ir, nm_ir, ne_ir, nc_ir, n_ir = cache_ir.pop("results")  # found, missing, empty, corrupt, total
+        if exists_ir and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path_ir}... {nf_ir} images, {nm_ir + ne_ir} backgrounds, {nc_ir} corrupt"
+            tqdm(None, desc=prefix + d, total=n_ir, initial=n_ir, bar_format=TQDM_BAR_FORMAT)  # display cache results
+            if cache_ir["msgs"]:
+                LOGGER.info("\n".join(cache_ir["msgs"]))  # display warnings
+        assert nf_ir > 0 or not augment, f"{prefix}No labels found in {cache_path_ir}, can not start training. {HELP_URL}"
+
+        # Read rgb cache
+        [cache_rgb.pop(k) for k in ("hash", "version", "msgs")]  # remove items 从cache中去除cache文件中其他无关键值如:'hash', 'version', 'msgs'等都删除
+        # labels: 如果数据集所有图片中没有一个多边形label，labels存储的label就都是原始label(都是正常的矩形label)
+        #         否则将所有图片正常gt的label存入labels 不正常gt(存在一个多边形)经过segments2boxes转换为正常的矩形label
+        # shapes: 所有图片的shape
+        # self.segments: 如果数据集所有图片中没有一个多边形label  self.segments=None
+        #                否则存储数据集中所有存在多边形gt的图片的所有原始label(可能有多边形label 也可能有矩形正常label)
+        # zip 是因为cache中所有labels、shapes、segments信息都是按每张img分开存储的, zip是将所有图片对应的信息叠在一起
+        labels_rgb, shapes_rgb, self.segments_rgb = zip(*cache_rgb.values())
+        nl_rgb = len(np.concatenate(labels_rgb, 0))  # number of labels
+        assert nl_rgb > 0 or not augment, f"{prefix}All labels empty in {cache_path_rgb}, can not start training. {HELP_URL}"
+        self.labels_rgb = list(labels_rgb)
+        self.shapes_rgb = np.array(shapes_rgb)
+        self.im_files_rgb = list(cache_rgb.keys())  # update
+        self.label_files_rgb = img2label_paths(cache_rgb.keys())  # update
+
+        # Read ir cache
+        [cache_ir.pop(k) for k in ("hash", "version", "msgs")]  # remove items
+        labels_ir, shapes_ir, self.segments_ir = zip(*cache_ir.values())
+        nl_ir = len(np.concatenate(labels_ir, 0))  # number of labels
+        assert nl_ir > 0 or not augment, f"{prefix}All labels empty in {cache_path_ir}, can not start training. {HELP_URL}"
+        self.labels_ir = list(labels_ir)
+        self.shapes_ir = np.array(shapes_ir)
+        self.im_files_ir = list(cache_ir.keys())  # update
+        self.label_files_ir = img2label_paths(cache_ir.keys())  # update
+
+        if min_items:
+            # Filter rgb images
+            include_rgb = np.array([len(x) >= min_items for x in self.labels_rgb]).nonzero()[0].astype(int)
+            LOGGER.info(f"{prefix}{n_rgb - len(include_rgb)}/{n_rgb} images filtered from dataset")
+            self.im_files_rgb = [self.im_files_rgb[i] for i in include_rgb]
+            self.label_files_rgb = [self.label_files_rgb[i] for i in include_rgb]
+            self.labels_rgb = [self.labels_rgb[i] for i in include_rgb]
+            self.segments_rgb = [self.segments_rgb[i] for i in include_rgb]
+            self.shapes_rgb = self.shapes_rgb[include_rgb]  # wh
+
+            # Filter ir images
+            include_ir = np.array([len(x) >= min_items for x in self.labels_ir]).nonzero()[0].astype(int)
+            LOGGER.info(f"{prefix}{n_ir - len(include_ir)}/{n_ir} images filtered from dataset")
+            self.im_files_ir = [self.im_files_ir[i] for i in include_ir]
+            self.label_files_ir = [self.label_files_ir[i] for i in include_ir]
+            self.labels_ir = [self.labels_ir[i] for i in include_ir]
+            self.segments_ir = [self.segments_ir[i] for i in include_ir]
+            self.shapes_ir = self.shapes_ir[include_ir]  # wh
+
+        # Create rgb indices
+        n_rgb = len(self.shapes_rgb)  # number of images
+        bi_rgb = np.floor(np.arange(n_rgb) / batch_size).astype(int)  # batch index
+        nb_rgb = bi_rgb[-1] + 1  # number of batches
+        self.batch_rgb = bi_rgb  # batch index of image
+        self.n_rgb = n_rgb
+        self.indices_rgb = np.arange(n_rgb) # 所有图片的索引
+        if rank > -1:  # DDP indices (see: SmartDistributedSampler)
+            # force each rank (i.e. GPU process) to sample the same subset of data on every epoch
+            self.indices_rgb = self.indices_rgb[np.random.RandomState(seed=seed).permutation(n_rgb) % WORLD_SIZE == RANK]
+
+        # Create ir indices
+        n_ir = len(self.shapes_ir)  # number of images
+        bi_ir = np.floor(np.arange(n_ir) / batch_size).astype(int)  # batch index
+        nb_ir = bi_ir[-1] + 1  # number of batches
+        self.batch_ir = bi_ir  # batch index of image
+        self.n_ir = n_ir
+        self.indices_ir = np.arange(n_ir) # 所有图片的索引
+        if rank > -1:  # DDP indices (see: SmartDistributedSampler)
+            # force each rank (i.e. GPU process) to sample the same subset of data on every epoch
+            self.indices_ir = self.indices_ir[np.random.RandomState(seed=seed).permutation(n_ir) % WORLD_SIZE == RANK]
+
+        # Update rgb labels
+        include_class_rgb = []  # filter labels to include only these classes (optional)
+        self.segments_rgb = list(self.segments_rgb)
+        include_class_array_rgb = np.array(include_class_rgb).reshape(1, -1)
+        for i, (label_rgb, segment_rgb) in enumerate(zip(self.labels_rgb, self.segments_rgb)):
+            if include_class_rgb:
+                j = (label_rgb[:, 0:1] == include_class_array_rgb).any(1)
+                self.labels_rgb[i] = label_rgb[j]
+                if segment_rgb:
+                    self.segments_rgb[i] = [segment_rgb[idx] for idx, elem in enumerate(j) if elem]
+            if single_cls:  # single-class training, merge all classes into 0
+                self.labels_rgb[i][:, 0] = 0
+
+        # Update ir labels
+        include_class_ir = []  # filter labels to include only these classes (optional)
+        self.segments_ir = list(self.segments_ir)
+        include_class_array_ir = np.array(include_class_ir).reshape(1, -1)
+        for i, (label_ir, segment_ir) in enumerate(zip(self.labels_ir, self.segments_ir)):
+            if include_class_ir:
+                j = (label_ir[:, 0:1] == include_class_array_ir).any(1)
+                self.labels_ir[i] = label_ir[j]
+                if segment_ir:
+                    self.segments_ir[i] = [segment_ir[idx] for idx, elem in enumerate(j) if elem]
+            if single_cls:  # single-class training, merge all classes into 0
+                self.labels_ir[i][:, 0] = 0
+
+
+        # Rectangular Training
+        # rgb
+        if self.rect:
+            # Sort by aspect ratio
+            # 对数据集按照高宽比进行排序,保证同一个batch的图片的形状差不多相同,再选择一个共同的shape代价也比较小
+            s_rgb = self.shapes_rgb  # wh
+            ar_rgb = s_rgb[:, 1] / s_rgb[:, 0]  # aspect ratio
+            irect_rgb = ar_rgb.argsort()
+            self.im_files_rgb = [self.im_files_rgb[i] for i in irect_rgb]
+            self.label_files_rgb = [self.label_files_rgb[i] for i in irect_rgb]
+            self.labels_rgb = [self.labels_rgb[i] for i in irect_rgb]
+            self.segments_rgb = [self.segments_rgb[i] for i in irect_rgb]
+            self.shapes_rgb = s_rgb[irect_rgb]  # wh
+            ar_rgb = ar_rgb[irect_rgb]
+
+            # Set training image shapes
+            # 计算每个batch采用的统一尺度
+            shapes_rgb = [[1, 1]] * nb_rgb
+            for i in range(nb_rgb):
+                ari_rgb = ar_rgb[bi_rgb == i]
+                mini_rgb, maxi_rgb = ari_rgb.min(), ari_rgb.max()
+                if maxi_rgb < 1:
+                    shapes_rgb[i] = [maxi_rgb, 1]
+                elif mini_rgb > 1:
+                    shapes_rgb[i] = [1, 1 / mini_rgb]
+
+            # 计算每个batch输入网络的shape值(向上设置为32的整数倍)
+            # 要求每个batch_shapes的高宽都是32的整数倍，所以要先除以32，取整再乘以32
+            self.batch_shapes_rgb = np.ceil(np.array(shapes_rgb) * img_size / stride + pad).astype(int) * stride
+
+        # ir
+        if self.rect:
+            # Sort by aspect ratio
+            # 对数据集按照高宽比进行排序,保证同一个batch的图片的形状差不多相同,再选择一个共同的shape代价也比较小
+            s_ir = self.shapes_ir  # wh
+            ar_ir = s_ir[:, 1] / s_ir[:, 0]  # aspect ratio
+            irect_ir = ar_ir.argsort()
+            self.im_files_ir = [self.im_files_ir[i] for i in irect_ir]
+            self.label_files_ir = [self.label_files_ir[i] for i in irect_ir]
+            self.labels_ir = [self.labels_ir[i] for i in irect_ir]
+            self.segments_ir = [self.segments_ir[i] for i in irect_ir]
+            self.shapes_ir = s_ir[irect_ir]  # wh
+            ar_ir = ar_ir[irect_ir]
+
+            # Set training image shapes
+            # 计算每个batch采用的统一尺度
+            shapes_ir = [[1, 1]] * nb_ir
+            for i in range(nb_ir):
+                ari_ir = ar_ir[bi_ir == i]
+                mini_ir, maxi_ir = ari_ir.min(), ari_ir.max()
+                if maxi_ir < 1:
+                    shapes_ir[i] = [maxi_ir, 1]
+                elif mini_ir > 1:
+                    shapes_ir[i] = [1, 1 / mini_ir]
+
+            # 计算每个batch输入网络的shape值(向上设置为32的整数倍)
+            # 要求每个batch_shapes的高宽都是32的整数倍，所以要先除以32，取整再乘以32
+            self.batch_shapes_rgb = np.ceil(np.array(shapes_rgb) * img_size / stride + pad).astype(int) * stride
+
+        # Cache images into RAM/disk for faster training
+        # if cache_images == "ram" and not self.check_cache_ram(prefix=prefix):
+        #     cache_images = False
+        self.ims_rgb = [None] * n_rgb
+        self.ims_ir = [None] * n_ir
+        self.npy_files_rgb = [Path(f_rgb).with_suffix(".npy") for f_rgb in self.im_files_rgb]
+        self.npy_files_ir = [Path(f_ir).with_suffix(".npy") for f_ir in self.im_files_ir]
+        # if cache_images:
+        #     b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
+        #     self.im_hw0, self.im_hw = [None] * n, [None] * n
+        #     fcn = self.cache_images_to_disk if cache_images == "disk" else self.load_image
+        #     results = ThreadPool(NUM_THREADS).imap(lambda i: (i, fcn(i)), self.indices)
+        #     pbar = tqdm(results, total=len(self.indices), bar_format=TQDM_BAR_FORMAT, disable=LOCAL_RANK > 0)
+        #     for i, x in pbar:
+        #         if cache_images == "disk":
+        #             b += self.npy_files[i].stat().st_size
+        #         else:  # 'ram'
+        #             self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
+        #             b += self.ims[i].nbytes * WORLD_SIZE
+        #         pbar.desc = f"{prefix}Caching images ({b / gb:.1f}GB {cache_images})"
+        #     pbar.close()
+
+        self.labels = self.labels_rgb
+        self.shapes = self.shapes_rgb
+        self.indices = self.indices_rgb
+        self.segments = self.segments_rgb
+        # self.batch_shapes = self.batch_shapes_rgb
+        # self.batch = self.batch_rgb
+        # self.n = self.n_rgb
+
+    def check_cache_ram(self, safety_margin=0.1, prefix=""):
+        # Check image caching requirements vs available memory
+        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
+        n = min(self.n, 30)  # extrapolate from 30 random images
+        for _ in range(n):
+            im = cv2.imread(random.choice(self.im_files))  # sample image
+            ratio = self.img_size / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
+            b += im.nbytes * ratio**2
+        mem_required = b * self.n / n  # GB required to cache dataset into RAM
+        mem = psutil.virtual_memory()
+        cache = mem_required * (1 + safety_margin) < mem.available  # to cache or not to cache, that is the question
+        if not cache:
+            LOGGER.info(
+                f'{prefix}{mem_required / gb:.1f}GB RAM required, '
+                f'{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, '
+                f"{'caching images ✅' if cache else 'not caching images ⚠️'}"
+            )
+        return cache
+
+    def cache_labels(self, imfiles, labelfiles, path=Path("./labels.cache"), prefix=""):
+        # Cache dataset labels, check images and read shapes
+        im_files = imfiles
+        label_files = labelfiles
+        x = {}  # dict
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{prefix}Scanning {path.parent / path.stem}..."
+        with Pool(NUM_THREADS) as pool:
+            pbar = tqdm(
+                pool.imap(verify_image_label, zip(im_files, label_files, repeat(prefix))),
+                desc=desc,
+                total=len(im_files),
+                bar_format=TQDM_BAR_FORMAT,
+            )
+            for im_file, lb, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x[im_file] = [lb, shape, segments]
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+
+        pbar.close()
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{prefix}WARNING ⚠️ No labels found in {path}. {HELP_URL}")
+        x["hash"] = get_hash(label_files + im_files)
+        x["results"] = nf, nm, ne, nc, len(im_files)
+        x["msgs"] = msgs  # warnings
+        x["version"] = self.cache_version  # cache version
+        try:
+            np.save(path, x)  # save cache for next time
+            path.with_suffix(".cache.npy").rename(path)  # remove .npy suffix
+            LOGGER.info(f"{prefix}New cache created: {path}")
+        except Exception as e:
+            LOGGER.warning(f"{prefix}WARNING ⚠️ Cache directory {path.parent} is not writeable: {e}")  # not writeable
+        return x
+
+    def __len__(self):
+        return len(self.im_files_rgb)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+
+    def __getitem__(self, index):
+        """
+        这部分是数据增强函数，一般一次性执行batch_size次。
+        训练 数据增强: mosaic(random_perspective) + hsv + 上下左右翻转
+        测试 数据增强: letterbox
+        :return torch.from_numpy(img): 这个index的图片数据(增强后) [3, 640, 640]
+        :return labels_out: 这个index图片的gt label [6, 6] = [gt_num, 0+class+xywh(normalized)]
+        :return self.img_files[index]: 这个index图片的路径地址
+        :return shapes: 这个batch的图片的shapes 测试时(矩形训练)才有  验证时为None   for COCO mAP rescaling
+        """
+        # 可以通过三种形式获取要进行数据增强的图片index  linear, shuffled, or image_weights
+        index_rgb = self.indices_rgb[index]  # linear, shuffled, or image_weights
+        index_ir = self.indices_ir[index]  # linear, shuffled, or image_weights
+
+        hyp = self.hyp
+        mosaic = self.mosaic and random.random() < hyp["mosaic"]
+        if mosaic:
+            # Load mosaic
+            img_rgb, labels_rgb, img_ir, labels_ir = self.load_mosaic_RGB_IR(index_rgb, index_ir)
+            shapes = None
+
+            # MixUp augmentation
+            if random.random() < hyp["mixup"]:
+                img_rgb, labels_rgb = mixup(img_rgb, labels_rgb, *self.load_mosaic(random.choice(self.indices_rgb)))
+                img_ir, labels_ir = mixup(img_ir, labels_ir, *self.load_mosaic(random.choice(self.indices_ir)))
+
+        else:
+            # Load image 载入图片后并进行一次resize
+            img_rgb, img_ir, (h0, w0), (h, w) = self.load_image_rgb_ir(index)
+
+            # Letterbox
+            # letterbox之前确定这张当前图片letterbox之后的shape，如果不用self.rect矩形训练shape就是self.img_size
+            # 如果使用self.rect矩形训练shape就是当前batch的shape
+            shape = self.batch_shapes_rgb[self.batch_rgb[index]] if self.rect else self.img_size  # final letterboxed shape
+            img_rgb, ratio, pad = letterbox(img_rgb, shape, auto=False, scaleup=self.augment)
+            img_ir, ratio, pad = letterbox(img_ir, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
+            labels = self.labels_rgb[index].copy()
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+            labels_rgb = labels
+            labels_ir = labels
+
+            if self.augment:
+                img_rgb, img_ir, labels_rgb, labels_ir = random_perspective_rgb_ir(
+                    img_rgb,
+                    img_ir,
+                    labels_rgb,
+                    labels_ir,
+                    degrees=hyp["degrees"],
+                    translate=hyp["translate"],
+                    scale=hyp["scale"],
+                    shear=hyp["shear"],
+                    perspective=hyp["perspective"],
+                )
+
+        nl = len(labels_rgb)  # number of labels
+        if nl:
+            labels_rgb[:, 1:5] = xyxy2xywhn(labels_rgb[:, 1:5], w=img_rgb.shape[1], h=img_rgb.shape[0], clip=True, eps=1e-3)
+
+        if self.augment:
+            # Albumentations
+            img_rgb, labels_rgb = self.albumentations(img_rgb, labels_rgb)
+            img_ir, labels_ir = self.albumentations(img_ir, labels_ir)
+            nl = len(labels_rgb)  # update after albumentations
+
+            # HSV color-space
+            augment_hsv(img_rgb, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            augment_hsv(img_ir, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+
+            # Flip up-down
+            if random.random() < hyp["flipud"]:
+                img_rgb = np.flipud(img_rgb)
+                img_ir = np.flipud(img_ir)
+                if nl:
+                    labels_rgb[:, 2] = 1 - labels_rgb[:, 2]
+
+            # Flip left-right
+            if random.random() < hyp["fliplr"]:
+                img_rgb = np.fliplr(img_rgb)
+                img_ir = np.fliplr(img_ir)
+                if nl:
+                    labels_rgb[:, 1] = 1 - labels_rgb[:, 1]
+
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
+
+        labels_out = torch.zeros((nl, 6))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels_rgb)
+
+        # img_rgb = cv2.resize(img_rgb, (self.img_size, self.img_size))
+        # img_ir = cv2.resize(img_ir, (self.img_size, self.img_size))
+
+        # Convert
+        img_rgb = img_rgb.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img_rgb = np.ascontiguousarray(img_rgb)
+        img_ir = img_ir.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img_ir = np.ascontiguousarray(img_ir)
+
+        # img_all = np.concatenate((img_rgb, img_ir), axis=0)
+
+        return torch.from_numpy(img_rgb), torch.from_numpy(img_ir), labels_out, self.im_files_rgb[index], self.im_files_ir[index], shapes
+    
+    def load_image_rgb_ir(self, i):
+        # Loads 1 image from dataset index 'i', returns (im, original hw, resized hw)
+        # 从self或者从对应图片路径中载入对应index的图片 并将原图中hw中较大者扩展到self.img_size, 较小者同比例扩展
+        im_rgb, f_rgb, fn_rgb, im_ir, f_ir, fn_ir = (
+            self.ims_rgb[i],
+            self.im_files_rgb[i],
+            self.npy_files_rgb[i],
+            self.ims_ir[i],
+            self.im_files_ir[i],
+            self.npy_files_ir[i],
+        )
+        if (im_rgb is None) and (im_ir is None):  # not cached in RAM
+            if fn_rgb.exists():  # load npy
+                im_rgb = np.load(fn_rgb)
+            else:  # read image
+                im_rgb = cv2.imread(f_rgb)  # BGR
+                assert im_rgb is not None, f"Image Not Found {f_rgb}"
+            if fn_ir.exists():  # load npy
+                im_ir = np.load(fn_ir)
+            else:  # read image
+                im_ir = cv2.imread(f_ir)  # BGR
+                assert im_ir is not None, f"Image Not Found {f_ir}"
+
+            h0, w0 = im_rgb.shape[:2]  # orig hw
+            r = self.img_size / max(h0, w0)  # ratio 缩放比例
+
+            if r != 1:  # if sizes are not equal
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                im_rgb = cv2.resize(im_rgb, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                im_ir = cv2.resize(im_ir, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+            return im_rgb, im_ir, (h0, w0), im_rgb.shape[:2]  # im, hw_original, hw_resized
+        return self.ims_rgb[i], self.ims_ir[i], self.im_hw0_rgb[i], self.im_hw_rgb[i]  # im, hw_original, hw_resized
+
+    def cache_images_to_disk(self, i):
+        # Saves an image as an *.npy file for faster loading
+        f = self.npy_files[i]
+        if not f.exists():
+            np.save(f.as_posix(), cv2.imread(self.im_files[i]))
+    
+    def load_mosaic_RGB_IR(self, index1, index2):
+        """用在LoadImagesAndLabels模块的__getitem__函数 进行mosaic数据增强
+        将四张图片拼接在一张马赛克图像中  loads images in a 4-mosaic
+        :param index1, index2: 需要获取的双通道图像索引
+        :return: img4_rgb, img4_ir: mosaic和随机透视变换后的一张图片  numpy(640, 640, 3)
+                labels4_rgb, labels4_ir: img4_rgb与img4_ir对应的target  [M, cls+x1y1x2y2]
+        """
+        # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
+        # labels4: 用于存放拼接图像（4张图拼成一张）的label信息(不包含segments多边形)
+        # segments4: 用于存放拼接图像（4张图拼成一张）的label信息(包含segments多边形)
+        index_rgb = index1
+        index_ir = index2
+
+        assert index_rgb == index_ir, 'INDEX RGB not equal to INDEX IR'
+        
+        labels4_rgb, segments4_rgb = [], []
+        labels4_ir, segments4_ir = [], []
+
+        s = self.img_size # 一般的图片大小
+
+        # 随机初始化拼接图像的中心点坐标  [0, s*2]之间随机取2个数作为拼接图像的中心坐标
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
+
+        # 从dataset中随机寻找额外的三张图像进行拼接,再随机选三张图片的index
+        indices = [index_rgb] + random.choices(self.indices, k=3)  # 3 additional image indices
+
+        random.shuffle(indices)
+        for i, index in enumerate(indices):
+            # Load image
+            img_rgb, img_ir, _, (h, w) = self.load_image_rgb_ir(index)
+
+            # place img in img4
+            if i == 0:  # top left
+                img4_rgb = np.full((s * 2, s * 2, img_rgb.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                img4_ir = np.full((s * 2, s * 2, img_ir.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            # 将截取的图像区域填充到马赛克图像的相应位置   img4[h, w, c]
+            # 将图像img的【(x1b,y1b)左上角 (x2b,y2b)右下角】区域截取出来填充到马赛克图像的【(x1a,y1a)左上角 (x2a,y2a)右下角】区域
+            img4_rgb[y1a:y2a, x1a:x2a] = img_rgb[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            img4_ir[y1a:y2a, x1a:x2a] = img_ir[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            padw = x1a - x1b
+            padh = y1a - y1b
+            
+            # labels: 获取对应拼接图像的所有正常label信息(如果有segments多边形会被转化为矩形label)
+            # segments: 获取对应拼接图像的所有不正常label信息(包含segments多边形也包含正常gt)
+            # Labels
+            labels_rgb, segments_rgb = self.labels_rgb[index].copy(), self.segments_rgb[index].copy()
+            labels_ir, segments_ir = self.labels_ir[index].copy(), self.segments_ir[index].copy()
+            if labels_rgb.size:
+                labels_rgb[:, 1:] = xywhn2xyxy(labels_rgb[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                segments_rgb = [xyn2xy(x, w, h, padw, padh) for x in segments_rgb]
+                labels_ir[:, 1:] = xywhn2xyxy(labels_ir[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                segments_ir = [xyn2xy(x, w, h, padw, padh) for x in segments_ir]
+            labels4_rgb.append(labels_rgb)
+            segments4_rgb.extend(segments_rgb)
+            labels4_ir.append(labels_ir)
+            segments4_ir.extend(segments_ir)
+
+        # Concat/clip labels 把labels4压缩到一起
+        labels4_rgb = np.concatenate(labels4_rgb, 0)
+        labels4_ir = np.concatenate(labels4_ir, 0)
+        for x in (labels4_rgb[:, 1:], *segments4_rgb):
+            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        for x in (labels4_ir[:, 1:], *segments4_ir):
+            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        # img4, labels4 = replicate(img4, labels4)  # replicate
+
+        # Augment
+        img4_rgb, labels4_rgb, segments4_rgb = copy_paste(img4_rgb, labels4_rgb, segments4_rgb, p=self.hyp["copy_paste"])
+        img4_ir, labels4_ir, segments4_ir = copy_paste(img4_ir, labels4_ir, segments4_ir, p=self.hyp["copy_paste"])
+
+        img4_rgb, img4_ir, labels4_rgb, labels4_ir = random_perspective_rgb_ir(
+            img4_rgb,
+            img4_ir,
+            labels4_rgb,
+            labels4_ir,
+            segments4_rgb,
+            segments4_ir,
+            degrees=self.hyp["degrees"],
+            translate=self.hyp["translate"],
+            scale=self.hyp["scale"],
+            shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"],
+            border=self.mosaic_border,
+        )  # border to remove
+
+        labels4_ir = labels4_rgb
+        segments4_ir = segments4_rgb
+
+        return img4_rgb, labels4_rgb, img4_ir, labels4_ir
+
+    def load_mosaic9(self, index):
+        # YOLOv5 9-mosaic loader. Loads 1 image + 8 random images into a 9-image mosaic
+        labels9, segments9 = [], []
+        s = self.img_size
+        indices = [index] + random.choices(self.indices, k=8)  # 8 additional image indices
+        random.shuffle(indices)
+        hp, wp = -1, -1  # height, width previous
+        for i, index in enumerate(indices):
+            # Load image
+            img, _, (h, w) = self.load_image(index)
+
+            # place img in img9
+            if i == 0:  # center
+                img9 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                h0, w0 = h, w
+                c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
+            elif i == 1:  # top
+                c = s, s - h, s + w, s
+            elif i == 2:  # top right
+                c = s + wp, s - h, s + wp + w, s
+            elif i == 3:  # right
+                c = s + w0, s, s + w0 + w, s + h
+            elif i == 4:  # bottom right
+                c = s + w0, s + hp, s + w0 + w, s + hp + h
+            elif i == 5:  # bottom
+                c = s + w0 - w, s + h0, s + w0, s + h0 + h
+            elif i == 6:  # bottom left
+                c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+            elif i == 7:  # left
+                c = s - w, s + h0 - h, s, s + h0
+            elif i == 8:  # top left
+                c = s - w, s + h0 - hp - h, s, s + h0 - hp
+
+            padx, pady = c[:2]
+            x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
+
+            # Labels
+            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            if labels.size:
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
+                segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
+            labels9.append(labels)
+            segments9.extend(segments)
+
+            # Image
+            img9[y1:y2, x1:x2] = img[y1 - pady :, x1 - padx :]  # img9[ymin:ymax, xmin:xmax]
+            hp, wp = h, w  # height, width previous
+
+        # Offset
+        yc, xc = (int(random.uniform(0, s)) for _ in self.mosaic_border)  # mosaic center x, y
+        img9 = img9[yc : yc + 2 * s, xc : xc + 2 * s]
+
+        # Concat/clip labels
+        labels9 = np.concatenate(labels9, 0)
+        labels9[:, [1, 3]] -= xc
+        labels9[:, [2, 4]] -= yc
+        c = np.array([xc, yc])  # centers
+        segments9 = [x - c for x in segments9]
+
+        for x in (labels9[:, 1:], *segments9):
+            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        # img9, labels9 = replicate(img9, labels9)  # replicate
+
+        # Augment
+        img9, labels9, segments9 = copy_paste(img9, labels9, segments9, p=self.hyp["copy_paste"])
+        img9, labels9 = random_perspective(
+            img9,
+            labels9,
+            segments9,
+            degrees=self.hyp["degrees"],
+            translate=self.hyp["translate"],
+            scale=self.hyp["scale"],
+            shear=self.hyp["shear"],
+            perspective=self.hyp["perspective"],
+            border=self.mosaic_border,
+        )  # border to remove
+
+        return img9, labels9
+
+    @staticmethod
+    def collate_fn(batch):
+        im_rgb, im_ir, label, path_rgb, path_ir, shapes = zip(*batch)  # transposed
+        for i, lb in enumerate(label):
+            lb[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(im_rgb, 0), torch.stack(im_ir, 0), torch.cat(label, 0), path_rgb, path_ir, shapes
 
     @staticmethod
     def collate_fn4(batch):

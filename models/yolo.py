@@ -142,19 +142,30 @@ class Segment(Detect):
 
 class BaseModel(nn.Module):
     # YOLOv5 base model
-    def forward(self, x, profile=False, visualize=False):
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+    def forward(self, x, x2, profile=False, visualize=False):
+        return self._forward_once(x, x2, profile, visualize)  # single-scale inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False):
+    def _forward_once(self, x, x2, profile=False, visualize=False):
+        # 各网络层输出, 各网络层推导耗时
+        # y: 存放着self.save=True的每一层的输出，因为后面的层结构concat等操作要用到
+        # dt: 在profile中做性能评估时使用
         y, dt = [], []  # outputs
         for m in self.model:
-            if m.f != -1:  # if not from previous layer
+            # m.f 就是该层的输入来源，如果不为-1或-4就不是从上一层而来
+            if (m.f != -1) and(m.f != -4):  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            # 测试该网络层的性能
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
+            # 使用该网络层进行推导, 得到该网络层的输出
+            if m.f == -4:
+                x = m(x2)
+            else:
+                x = m(x)  # run
+            # 存放着self.save的每一层的输出，因为后面需要用来作concat等操作要用到  不在self.save层的输出就为None
+            y.append(x if m.i in self.save else None)  # save output 将每一层的输出结果保存到y
             if visualize:
+                # 绘制该 batch 中第一张图像的特征图
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
         return x
 
@@ -226,34 +237,38 @@ class DetectionModel(BaseModel):
         if isinstance(m, (Detect, Segment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
-            forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+            # forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
+            # m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+            m.stride = torch.Tensor([8.0, 16.0, 32.0])
             check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_biases()  # only run once
+            m.anchors /= m.stride.view(-1, 1, 1) # 原始定义的anchor是原始图片上的像素值，要将其缩放至特征图的大小
+            self.stride = m.stride # 检查anchor顺序与stride顺序是否一致
+            self._initialize_biases()  # only run once 初始化bias
 
         # Init weights, biases
         initialize_weights(self)
         self.info()
         LOGGER.info("")
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, x2, augment=False, profile=False, visualize=False):
         if augment:
-            return self._forward_augment(x)  # augmented inference, None
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+            return self._forward_augment(x, x2)  # augmented inference, None
+        return self._forward_once(x, x2, profile, visualize)  # single-scale inference, train
 
-    def _forward_augment(self, x):
+    def _forward_augment(self, x, x2):
         img_size = x.shape[-2:]  # height, width
         s = [1, 0.83, 0.67]  # scales
         f = [None, 3, None]  # flips (2-ud, 3-lr)
         y = []  # outputs
         for si, fi in zip(s, f):
+            # scale_img函数的作用就是根据传入的参数缩放和翻转图像
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = self._forward_once(xi)[0]  # forward
+            xi2 = scale_img(x2.flip(fi) if fi else x2, si, gs=int(self.stride.max()))
+            yi = self._forward_once(xi, xi2)[0]  # forward
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
+        # 对不同尺寸进行不同程度的筛选
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
 
@@ -380,14 +395,20 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             DWConvTranspose2d,
             C3x,
         }:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, ch_mul)
+            if m is Conv and args[0] == 64:    # new
+                c1, c2 = 3, args[0]
+                if c2 != no:  # if not output
+                    c2 = make_divisible(c2 * gw, ch_mul)
+                args = [c1, c2, *args[1:]]
+            else:
+                c1, c2 = ch[f], args[0]
+                if c2 != no:  # if not output
+                    c2 = make_divisible(c2 * gw, ch_mul)
 
-            args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
-                args.insert(2, n)  # number of repeats
-                n = 1
+                args = [c1, c2, *args[1:]]
+                if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+                    args.insert(2, n)  # number of repeats
+                    n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -421,7 +442,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str, default="yolov5s.yaml", help="model.yaml")
+    parser.add_argument("--cfg", type=str, default="yolov5s_2channelpro.yaml", help="model.yaml")
     parser.add_argument("--batch-size", type=int, default=1, help="total batch size for all GPUs")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--profile", action="store_true", help="profile model speed")

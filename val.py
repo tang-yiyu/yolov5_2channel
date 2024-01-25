@@ -38,7 +38,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
+from utils.dataloaders import create_dataloader_rgb_ir
 from utils.general import (
     LOGGER,
     TQDM_BAR_FORMAT,
@@ -146,11 +146,16 @@ def run(
 ):
     # Initialize/load model and set device
     training = model is not None
-    if training:  # called by train.py
+    if training:  # called by train.py 通过train.py调用的run函数
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
+        # 如果设备类型不是cpu，则将模型由32位浮点数转换为16位浮点数，精度减半
         half &= device.type != "cpu"  # half precision only supported on CUDA
         model.half() if half else model.float()
-    else:  # called directly
+        # 在运行时保存labels文件
+        # (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+        # if save_txt:
+        #     labels_dir = increment_path(Path(save_dir) / 'labels' / 'pred', exist_ok=False, mkdir=True)
+    else:  # called directly 直接通过val.py调用run函数
         device = select_device(device, batch_size=batch_size)
 
         # Directories
@@ -189,11 +194,14 @@ def run(
                 f"{weights} ({ncm} classes) trained on different --data than what you passed ({nc} "
                 f"classes). Pass correct combination of --weights and --data that are trained together."
             )
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        # model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
-        dataloader = create_dataloader(
-            data[task],
+        val_path_rgb = data['val_rgb']
+        val_path_ir = data['val_ir']
+        dataloader = create_dataloader_rgb_ir(
+            val_path_rgb,
+            val_path_ir,
             imgsz,
             batch_size,
             stride,
@@ -204,34 +212,38 @@ def run(
             prefix=colorstr(f"{task}: "),
         )[0]
 
-    seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
+    seen = 0 # 初始化已完成测试的图片数量
+    confusion_matrix = ConfusionMatrix(nc=nc) # 调用matrics中函数 存储混淆矩阵
     names = model.names if hasattr(model, "names") else model.module.names  # get class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "P", "R", "mAP50", "mAP50-95")
-    tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 # 初始化detection中各个指标的值
     dt = Profile(device=device), Profile(device=device), Profile(device=device)  # profiling times
-    loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
+    loss = torch.zeros(3, device=device) # 初始化网络训练的loss
+    jdict, stats, ap, ap_class = [], [], [], [] # 初始化json文件涉及到的字典、统计信息、AP、每一个类别的AP、图片汇总
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (im_rgb, im_ir, targets, paths_rgb, paths_ir, shapes) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
             if cuda:
-                im = im.to(device, non_blocking=True)
+                im_rgb = im_rgb.to(device, non_blocking=True)
+                im_ir = im_ir.to(device, non_blocking=True)
                 targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = im.shape  # batch size, channels, height, width
+            im_rgb = im_rgb.half() if half else im_rgb.float()  # uint8 to fp16/32
+            im_rgb /= 255  # 0 - 255 to 0.0 - 1.0
+            im_ir = im_ir.half() if half else im_ir.float()  # uint8 to fp16/32
+            im_ir /= 255  # 0 - 255 to 0.0 - 1.0
+            nb, _, height, width = im_rgb.shape  # batch size, channels, height, width
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            preds, train_out = model(im_rgb, im_ir) if compute_loss else (model(im_rgb, im_ir, augment=augment), None)
 
         # Loss
+        # compute_loss不为空，说明正在执行train.py，根据传入的compute_loss计算损失值
         if compute_loss:
             loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
@@ -247,9 +259,9 @@ def run(
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
+            path_rgb, path_ir, shape = Path(paths_rgb[si]), Path(paths_ir[si]), shapes[si][0] # 第si张图片对应的文件路径
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
+            seen += 1 # 统计测试图片数量 +1
 
             if npr == 0:
                 if nl:
@@ -262,12 +274,15 @@ def run(
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            # 调用general.py中的函数 将图片调整为原图大小
+            scale_boxes(im_rgb[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            scale_boxes(im_ir[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                scale_boxes(im_rgb[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                scale_boxes(im_ir[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
@@ -277,19 +292,23 @@ def run(
             # Save/log
             if save_txt:
                 (save_dir / "labels").mkdir(parents=True, exist_ok=True)
-                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
+                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path_rgb.stem}.txt")
             if save_json:
-                save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.run("on_val_image_end", pred, predn, path, names, im[si])
+                save_one_json(predn, jdict, path_rgb, class_map)  # append to COCO-JSON dictionary
+            callbacks.run("on_val_image_end", pred, predn, path_rgb, names, im_rgb[si])
+            callbacks.run("on_val_image_end", pred, predn, path_ir, names, im_ir[si])
 
         # Plot images
         if plots and batch_i < 3:
-            plot_images(im, targets, paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
-            plot_images(im, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
+            plot_images(im_rgb, targets, paths_rgb, save_dir / f"val_batch{batch_i}_labels_rgb.jpg", names)  # labels
+            plot_images(im_rgb, output_to_target(preds), paths_rgb, save_dir / f"val_batch{batch_i}_pred_rgb.jpg", names)  # pred
+            plot_images(im_ir, targets, paths_ir, save_dir / f"val_batch{batch_i}_labels_ir.jpg", names)  # labels
+            plot_images(im_ir, output_to_target(preds), paths_ir, save_dir / f"val_batch{batch_i}_pred_ir.jpg", names)  # pred
 
-        callbacks.run("on_val_batch_end", batch_i, im, targets, paths, shapes, preds)
+        callbacks.run("on_val_batch_end", batch_i, im_rgb, targets, paths_rgb, shapes, preds)
+        callbacks.run("on_val_batch_end", batch_i, im_ir, targets, paths_ir, shapes, preds)
 
-    # Compute metrics
+    # Compute metrics 计算指标
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
@@ -298,7 +317,7 @@ def run(
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
     # Print results
-    pf = "%22s" + "%11i" * 2 + "%11.3g" * 4  # print format
+    pf = "%22s" + "%11i" * 2 + "%11.3g" * 4  # print format 打印格式
     LOGGER.info(pf % ("all", seen, nt.sum(), mp, mr, map50, map))
     if nt.sum() == 0:
         LOGGER.warning(f"WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels")

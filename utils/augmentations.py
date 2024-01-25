@@ -230,6 +230,105 @@ def random_perspective(
 
     return im, targets
 
+def random_perspective_rgb_ir(
+    im_rgb, im_ir, targets_rgb=(),targets_ir=(), segments_rgb=(), segments_ir=(), degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0)
+):
+    # 进行随机透视变换，对mosaic整合后的图片进行随机旋转、缩放、平移、裁剪，透视变换，并resize为输入大小img_size
+    # degrees: 旋转和缩放矩阵参数; translate: 平移矩阵参数; scale: 缩放矩阵参数; shear: 剪切矩阵参数; perspective: 透视变换参数; border: 用于确定最后输出的图片大小.
+    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(0.1, 0.1), scale=(0.9, 1.1), shear=(-10, 10))
+    # targets = [cls, xyxy]
+
+    im = im_rgb
+    targets = targets_rgb
+    segments = segments_rgb
+
+    # 设定输出图片的 H W
+    height = im.shape[0] + border[0] * 2  # shape(h,w,c)
+    width = im.shape[1] + border[1] * 2
+
+    # Center 设置中心平移矩阵
+    C = np.eye(3)
+    C[0, 2] = -im.shape[1] / 2  # x translation (pixels)
+    C[1, 2] = -im.shape[0] / 2  # y translation (pixels)
+
+    # Perspective 设置透视变换矩阵
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
+    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
+
+    # Rotation and Scale 设置旋转和缩放矩阵
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
+    # s = 2 ** random.uniform(-scale, scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+    # Shear 设置剪切矩阵
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+
+    # Translation 设置平移矩阵
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+
+    # Combined rotation matrix @ 表示矩阵乘法  生成仿射变换矩阵M
+    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+        if perspective:
+            # 透视变换函数，实现旋转平移缩放变换后的平行线不再平行
+            im_rgb = cv2.warpPerspective(im_rgb, M, dsize=(width, height), borderValue=(114, 114, 114))
+            im_ir = cv2.warpPerspective(im_ir, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:  # affine
+            # 仿射变换函数，实现旋转平移缩放变换后的平行线依旧平行
+            im_rgb = cv2.warpAffine(im_rgb, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+            im_ir = cv2.warpAffine(im_ir, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    # Visualize
+    # import matplotlib.pyplot as plt
+    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
+    # ax[0].imshow(im[:, :, ::-1])  # base
+    # ax[1].imshow(im2[:, :, ::-1])  # warped
+
+    # Transform label coordinates 调整标签信息
+    n = len(targets)
+    if n:
+        use_segments = any(x.any() for x in segments) and len(segments) == n
+        new = np.zeros((n, 4))
+        if use_segments:  # warp segments
+            segments = resample_segments(segments)  # upsample
+            for i, segment in enumerate(segments):
+                xy = np.ones((len(segment), 3))
+                xy[:, :2] = segment
+                xy = xy @ M.T  # transform
+                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
+
+                # clip
+                new[i] = segment2box(xy, width, height)
+
+        else:  # warp boxes
+            xy = np.ones((n * 4, 3))
+            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+            xy = xy @ M.T  # transform
+            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+
+            # create new boxes
+            x = xy[:, [0, 2, 4, 6]]
+            y = xy[:, [1, 3, 5, 7]]
+            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+            # clip
+            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
+            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+
+        # filter candidates
+        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        targets = targets[i]
+        targets[:, 1:5] = new[i]
+
+    return im_rgb, im_ir, targets, targets
 
 def copy_paste(im, labels, segments, p=0.5):
     # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)

@@ -1,0 +1,1 @@
+scp -r -P 33024 /data1/tyy/yolov5_2channel/runs/detect/kaist2channel user@10.70.17.11:/data1/tyy/KAIST_MR/mykaist2channel
