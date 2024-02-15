@@ -258,3 +258,6 @@ fabric.properties
 
 # Additional files
 yolov5_original/
+train.sh
+detect.sh
+scp.sh

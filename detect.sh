@@ -1,1 +1,0 @@
-python detect.py --weights runs/train/kaist2yolov5s/weights/best.pt --conf-thres 0.001 --iou-thres 0.5 --device 0 --save-txt --save-conf --name kaist2yolov5s

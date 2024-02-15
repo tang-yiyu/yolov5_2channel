@@ -1,2 +1,0 @@
-python train.py --weights yolov5s.pt --cfg ./models/yolov5s_2channelpro.yaml --data ./data/kaist_icaf.yaml --device 0 --multi-scale --batch-size 4 --name kaist2yolov5s --epochs 60
-# python train.py --weights yolov5l.pt --cfg ./models/yolov5l_2channelpro.yaml --data ./data/kaist_icaf.yaml --device 0 --multi-scale --batch-size 2 --name kaist2yolov5l --epochs 60
