@@ -152,7 +152,7 @@ class BaseModel(nn.Module):
         y, dt = [], []  # outputs
         for m in self.model:
             # m.f 就是该层的输入来源，如果不为-1或-4就不是从上一层而来
-            if (m.f != -1) and(m.f != -4):  # if not from previous layer
+            if (m.f != -1) and (m.f != -4):  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             # 测试该网络层的性能
             if profile:
