@@ -194,7 +194,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect 判断预训练参数和新创建的模型参数有多少是相同的
         # 给双通道的backbone赋初始权重
         for key in list(csd.keys()):
-            csd[key[:6] + str(int(key[6])+10) + key[7:]] = csd[key]
+            csd[key[:6] + str(int(key[6]) + 10) + key[7:]] = csd[key]
         # 打印权重的赋值结果
         for key in csd.keys():
             print(key)
